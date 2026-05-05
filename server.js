@@ -3,7 +3,14 @@ const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const Anthropic = require('@anthropic-ai/sdk');
-const { createClient: createDeepgramClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+const deepgramSdk = require('@deepgram/sdk');
+const createDeepgramClient = deepgramSdk.createClient || deepgramSdk.default?.createClient;
+const LiveTranscriptionEvents = deepgramSdk.LiveTranscriptionEvents || {
+  Open: 'open',
+  Close: 'close',
+  Transcript: 'Results',
+  Error: 'error',
+};
 const { randomUUID } = require('crypto');
 
 const app = express();
