@@ -25,7 +25,6 @@ Be warm and direct. Don't pad with filler words.`;
 // ════════════════════════════════════════════════════════════════════
 
 const conversations = {};
-const taskByCall = {};
 const audioCache = {};
 const AUDIO_TTL_MS = 5 * 60 * 1000;
 
@@ -154,17 +153,13 @@ wss.on('connection', (twilioWs) => {
   const history = [];
   let isProcessing = false;
 
-  // Connect directly to Deepgram WebSocket — no SDK
+  // Simplified Deepgram URL — minimal params
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: '8000',
-    channels: '1',
-    model: 'nova-2-phonecall',
+    model: 'nova-2',
     smart_format: 'true',
-    punctuate: 'true',
     interim_results: 'false',
-    endpointing: '800',
-    utterance_end_ms: '1000',
   }).toString();
 
   try {
@@ -179,8 +174,6 @@ wss.on('connection', (twilioWs) => {
     dgWs.on('message', async (raw) => {
       try {
         const data = JSON.parse(raw.toString());
-
-        // Only care about transcripts
         if (data.type !== 'Results') return;
 
         const transcript = data.channel?.alternatives?.[0]?.transcript;
@@ -224,7 +217,6 @@ wss.on('connection', (twilioWs) => {
     console.error('Deepgram setup error:', err.message);
   }
 
-  // Twilio messages
   twilioWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -238,7 +230,7 @@ wss.on('connection', (twilioWs) => {
           streamSid = msg.start.streamSid;
           console.log('▶️  Stream started:', streamSid);
           (async () => {
-            await new Promise(r => setTimeout(r, 200)); // small buffer for stream readiness
+            await new Promise(r => setTimeout(r, 200));
             const greeting = "Hello, this is pla FAIR. How can I help?";
             history.push({ role: 'assistant', content: greeting });
             await streamElevenLabsToTwilio(greeting, twilioWs, streamSid);
@@ -246,13 +238,12 @@ wss.on('connection', (twilioWs) => {
           break;
 
         case 'media':
-          // Forward audio to Deepgram (when ready)
           if (dgWs && dgWs.readyState === WebSocket.OPEN && msg.media?.payload) {
             const audio = Buffer.from(msg.media.payload, 'base64');
             try {
               dgWs.send(audio);
             } catch (err) {
-              // ignore — Deepgram might be closing
+              // ignore
             }
           }
           break;
@@ -284,7 +275,6 @@ wss.on('connection', (twilioWs) => {
   });
 });
 
-// Stream ElevenLabs μ-law audio directly to Twilio
 async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
   const apiKey = process.env.ELEVENLABS_KEY;
@@ -321,9 +311,7 @@ async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
 
     let totalBytes = 0;
 
-    // Use Node.js stream (works on all Node versions)
     if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
-      // Async iterable (Node 18+)
       for await (const chunk of response.body) {
         if (twilioWs.readyState !== 1) break;
         const payload = Buffer.from(chunk).toString('base64');
@@ -335,7 +323,6 @@ async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
         totalBytes += chunk.length;
       }
     } else if (response.body && response.body.getReader) {
-      // Browser-style (Node fetch)
       const reader = response.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -350,7 +337,6 @@ async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
         totalBytes += value.length;
       }
     } else {
-      // Fallback: just buffer the whole thing
       const buf = Buffer.from(await response.arrayBuffer());
       const payload = buf.toString('base64');
       twilioWs.send(JSON.stringify({
@@ -366,8 +352,6 @@ async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
     console.error('ElevenLabs stream error:', err.message);
   }
 }
-
-// ════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
   res.send('PLA FAIR server is alive! Streaming + legacy routes ready.');
