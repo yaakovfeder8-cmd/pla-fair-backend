@@ -8,10 +8,10 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
-    "@deepgram/sdk": "latest",
+    "@deepgram/sdk": "^5.1.0",
     "dotenv": "latest",
     "express": "latest",
     "twilio": "latest",
-    "ws": "latest"
+    "ws": "^8.20.0"
   }
 }
