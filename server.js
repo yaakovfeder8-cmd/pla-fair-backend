@@ -128,7 +128,7 @@ app.get('/audio/:id', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-// STREAMING ROUTES — Deepgram via direct WebSocket (no SDK)
+// STREAMING WITH FULL DUPLEX INTERRUPTION
 // ════════════════════════════════════════════════════════════════════
 
 app.post('/stream-voice', (req, res) => {
@@ -148,20 +148,27 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 wss.on('connection', (twilioWs) => {
   console.log('🔌 [STREAM] Twilio connected');
 
+  // ─── Per-call state ─────────────────────────────────────────────────
   let streamSid = null;
   let dgWs = null;
   const history = [];
-  let isProcessing = false;
 
-  // Simplified Deepgram URL — minimal params
+  // Interruption-related state
+  let isAiSpeaking = false;        // true while ElevenLabs audio is being sent
+  let currentAbortController = null; // cancels in-flight fetch
+  let interimUserText = '';        // builds up while user is talking
+  let isProcessing = false;        // prevents overlapping AI responses
+
+  // Connect to Deepgram with INTERIM RESULTS for interruption detection
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
-  encoding: 'mulaw',
-  sample_rate: '8000',
-  model: 'nova-2',
-  smart_format: 'true',
-  interim_results: 'false',
-  endpointing: '1500',           // wait 1.5 sec of silence before "done"
-  utterance_end_ms: '2000',      // 2 sec absolute max
+    encoding: 'mulaw',
+    sample_rate: '8000',
+    model: 'nova-2',
+    smart_format: 'true',
+    interim_results: 'true',         // we now get interim transcripts
+    utterance_end_ms: '1000',        // wait 1 sec of voice silence
+    vad_events: 'true',              // get speech-started/ended events
+    endpointing: '300',              // tighter endpointing for responsiveness
   }).toString();
 
   try {
@@ -170,38 +177,74 @@ wss.on('connection', (twilioWs) => {
     });
 
     dgWs.on('open', () => {
-      console.log('✅ Deepgram WebSocket connected');
+      console.log('✅ Deepgram connected (full duplex mode)');
     });
 
     dgWs.on('message', async (raw) => {
       try {
         const data = JSON.parse(raw.toString());
-        if (data.type !== 'Results') return;
 
-        const transcript = data.channel?.alternatives?.[0]?.transcript;
-        if (!transcript || !transcript.trim()) return;
-        if (!data.is_final) return;
-        if (isProcessing) return;
+        // ── VAD: Speech started ──────────────────────────────────────
+        if (data.type === 'SpeechStarted') {
+          // User started talking. If AI is speaking, interrupt it.
+          if (isAiSpeaking) {
+            console.log('✋ INTERRUPT: user started talking, stopping AI');
+            interruptAi();
+          }
+          return;
+        }
 
-        console.log('🗣️  USER:', transcript);
-        isProcessing = true;
-        history.push({ role: 'user', content: transcript });
+        // ── Interim/Final transcript results ─────────────────────────
+        if (data.type === 'Results') {
+          const transcript = data.channel?.alternatives?.[0]?.transcript;
+          if (!transcript || !transcript.trim()) return;
 
-        try {
-          const message = await claude.messages.create({
-            model: 'claude-sonnet-4-5',
-            max_tokens: 120,
-            system: SYSTEM_PROMPT,
-            messages: history,
-          });
-          const reply = message.content[0].text;
-          history.push({ role: 'assistant', content: reply });
-          console.log('🤖 PLA FAIR:', reply);
-          await streamElevenLabsToTwilio(reply, twilioWs, streamSid);
-        } catch (err) {
-          console.error('AI error:', err.message);
-        } finally {
-          isProcessing = false;
+          if (!data.is_final) {
+            // Interim — user is still talking. Just track it.
+            interimUserText = transcript;
+            // Backup interruption check: if we got interim text but missed
+            // SpeechStarted, still interrupt
+            if (isAiSpeaking && transcript.length > 2) {
+              console.log('✋ INTERRUPT (via interim):', transcript);
+              interruptAi();
+            }
+            return;
+          }
+
+          // is_final = true → user finished a sentence
+          // Don't process yet — wait for UtteranceEnd (handles natural pauses)
+          interimUserText = transcript;
+          return;
+        }
+
+        // ── UtteranceEnd: user truly stopped talking ─────────────────
+        if (data.type === 'UtteranceEnd') {
+          if (!interimUserText.trim()) return;
+          if (isProcessing) return;
+
+          const userSaid = interimUserText.trim();
+          interimUserText = '';
+
+          console.log('🗣️  USER:', userSaid);
+          isProcessing = true;
+          history.push({ role: 'user', content: userSaid });
+
+          try {
+            const message = await claude.messages.create({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 120,
+              system: SYSTEM_PROMPT,
+              messages: history,
+            });
+            const reply = message.content[0].text;
+            history.push({ role: 'assistant', content: reply });
+            console.log('🤖 PLA FAIR:', reply);
+            await streamAudioToTwilio(reply);
+          } catch (err) {
+            console.error('AI error:', err.message);
+          } finally {
+            isProcessing = false;
+          }
         }
       } catch (err) {
         console.error('Deepgram message error:', err.message);
@@ -219,6 +262,123 @@ wss.on('connection', (twilioWs) => {
     console.error('Deepgram setup error:', err.message);
   }
 
+  // ─── Interrupt the currently playing AI response ────────────────────
+  function interruptAi() {
+    isAiSpeaking = false;
+
+    // Cancel the in-flight ElevenLabs request
+    if (currentAbortController) {
+      try { currentAbortController.abort(); } catch {}
+      currentAbortController = null;
+    }
+
+    // Tell Twilio to flush queued audio
+    if (twilioWs.readyState === 1 && streamSid) {
+      twilioWs.send(JSON.stringify({
+        event: 'clear',
+        streamSid,
+      }));
+    }
+  }
+
+  // ─── Stream ElevenLabs audio to Twilio (interruptible) ──────────────
+  async function streamAudioToTwilio(text) {
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    const apiKey = process.env.ELEVENLABS_KEY;
+    if (!voiceId || !apiKey) {
+      console.error('Missing ElevenLabs config');
+      return;
+    }
+
+    console.log('🎙️  Speaking:', text.slice(0, 50));
+
+    isAiSpeaking = true;
+    currentAbortController = new AbortController();
+
+    try {
+      const response = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
+        {
+          method: 'POST',
+          headers: {
+            'xi-api-key': apiKey,
+            'Content-Type': 'application/json',
+            'Accept': 'audio/basic',
+          },
+          body: JSON.stringify({
+            text,
+            model_id: 'eleven_flash_v2_5',
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          }),
+          signal: currentAbortController.signal,
+        }
+      );
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        console.error('ElevenLabs failed:', response.status, errText.slice(0, 200));
+        isAiSpeaking = false;
+        return;
+      }
+
+      let totalBytes = 0;
+
+      // Iterate over response chunks, but check for interruption every chunk
+      try {
+        if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
+          for await (const chunk of response.body) {
+            // Bail out if interrupted or socket closed
+            if (!isAiSpeaking) break;
+            if (twilioWs.readyState !== 1) break;
+
+            const payload = Buffer.from(chunk).toString('base64');
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload },
+            }));
+            totalBytes += chunk.length;
+          }
+        } else if (response.body && response.body.getReader) {
+          const reader = response.body.getReader();
+          while (true) {
+            if (!isAiSpeaking) break;
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (twilioWs.readyState !== 1) break;
+            const payload = Buffer.from(value).toString('base64');
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload },
+            }));
+            totalBytes += value.length;
+          }
+        }
+      } catch (streamErr) {
+        if (streamErr.name === 'AbortError') {
+          console.log(`🚫 Audio aborted (${totalBytes} bytes sent before interrupt)`);
+        } else {
+          console.error('Stream read error:', streamErr.message);
+        }
+      }
+
+      if (isAiSpeaking) {
+        console.log(`✅ Audio fully sent (${totalBytes} bytes)`);
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        console.log('🚫 ElevenLabs request cancelled');
+      } else {
+        console.error('ElevenLabs error:', err.message);
+      }
+    } finally {
+      isAiSpeaking = false;
+      currentAbortController = null;
+    }
+  }
+
+  // ─── Handle Twilio events ───────────────────────────────────────────
   twilioWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -235,23 +395,26 @@ wss.on('connection', (twilioWs) => {
             await new Promise(r => setTimeout(r, 200));
             const greeting = "Hello, this is pla FAIR. How can I help?";
             history.push({ role: 'assistant', content: greeting });
-            await streamElevenLabsToTwilio(greeting, twilioWs, streamSid);
+            await streamAudioToTwilio(greeting);
           })();
           break;
 
         case 'media':
+          // Forward audio to Deepgram (always — even while AI speaks)
           if (dgWs && dgWs.readyState === WebSocket.OPEN && msg.media?.payload) {
             const audio = Buffer.from(msg.media.payload, 'base64');
             try {
               dgWs.send(audio);
-            } catch (err) {
-              // ignore
-            }
+            } catch {}
           }
           break;
 
         case 'stop':
           console.log('⏹️  Stream stopped');
+          isAiSpeaking = false;
+          if (currentAbortController) {
+            try { currentAbortController.abort(); } catch {}
+          }
           if (dgWs && dgWs.readyState === WebSocket.OPEN) {
             try {
               dgWs.send(JSON.stringify({ type: 'CloseStream' }));
@@ -267,6 +430,10 @@ wss.on('connection', (twilioWs) => {
 
   twilioWs.on('close', () => {
     console.log('🔌 Twilio WS closed');
+    isAiSpeaking = false;
+    if (currentAbortController) {
+      try { currentAbortController.abort(); } catch {}
+    }
     if (dgWs && dgWs.readyState === WebSocket.OPEN) {
       try { dgWs.close(); } catch {}
     }
@@ -277,83 +444,7 @@ wss.on('connection', (twilioWs) => {
   });
 });
 
-async function streamElevenLabsToTwilio(text, twilioWs, streamSid) {
-  const voiceId = process.env.ELEVENLABS_VOICE_ID;
-  const apiKey = process.env.ELEVENLABS_KEY;
-  if (!voiceId || !apiKey) {
-    console.error('Missing ElevenLabs config');
-    return;
-  }
-
-  console.log('🎙️  Generating audio for:', text.slice(0, 50));
-
-  try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
-      {
-        method: 'POST',
-        headers: {
-          'xi-api-key': apiKey,
-          'Content-Type': 'application/json',
-          'Accept': 'audio/basic',
-        },
-        body: JSON.stringify({
-          text,
-          model_id: 'eleven_flash_v2_5',
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error('ElevenLabs failed:', response.status, errText.slice(0, 200));
-      return;
-    }
-
-    let totalBytes = 0;
-
-    if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
-      for await (const chunk of response.body) {
-        if (twilioWs.readyState !== 1) break;
-        const payload = Buffer.from(chunk).toString('base64');
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload },
-        }));
-        totalBytes += chunk.length;
-      }
-    } else if (response.body && response.body.getReader) {
-      const reader = response.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (twilioWs.readyState !== 1) break;
-        const payload = Buffer.from(value).toString('base64');
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload },
-        }));
-        totalBytes += value.length;
-      }
-    } else {
-      const buf = Buffer.from(await response.arrayBuffer());
-      const payload = buf.toString('base64');
-      twilioWs.send(JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: { payload },
-      }));
-      totalBytes = buf.length;
-    }
-
-    console.log(`✅ Audio sent (${totalBytes} bytes)`);
-  } catch (err) {
-    console.error('ElevenLabs stream error:', err.message);
-  }
-}
+// ════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
   res.send('PLA FAIR server is alive! Streaming + legacy routes ready.');
@@ -364,5 +455,5 @@ server.listen(PORT, () => {
   console.log(`🧠 Claude: READY`);
   console.log(`🎙️  ElevenLabs voice: ${process.env.ELEVENLABS_VOICE_ID || 'NOT SET'}`);
   console.log(`📞 Legacy inbound: /voice (Gather-based, slower but stable)`);
-  console.log(`⚡ STREAMING inbound: /stream-voice (Media Streams + direct Deepgram WS)`);
+  console.log(`⚡ STREAMING inbound: /stream-voice (full duplex with interruptions)`);
 });
