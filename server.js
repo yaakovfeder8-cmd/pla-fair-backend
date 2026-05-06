@@ -155,11 +155,13 @@ wss.on('connection', (twilioWs) => {
 
   // Simplified Deepgram URL — minimal params
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
-    encoding: 'mulaw',
-    sample_rate: '8000',
-    model: 'nova-2',
-    smart_format: 'true',
-    interim_results: 'false',
+  encoding: 'mulaw',
+  sample_rate: '8000',
+  model: 'nova-2',
+  smart_format: 'true',
+  interim_results: 'false',
+  endpointing: '1500',           // wait 1.5 sec of silence before "done"
+  utterance_end_ms: '2000',      // 2 sec absolute max
   }).toString();
 
   try {
