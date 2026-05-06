@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 app.use(express.urlencoded({ extended: false }));
+// NEW: parse JSON for Vapi webhook (Vapi sends JSON, not form-encoded)
+app.use(express.json({ limit: '5mb' }));
 
 const claude = new Anthropic.default({
   apiKey: process.env.ANTHROPIC_KEY,
@@ -148,27 +150,24 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 wss.on('connection', (twilioWs) => {
   console.log('🔌 [STREAM] Twilio connected');
 
-  // ─── Per-call state ─────────────────────────────────────────────────
   let streamSid = null;
   let dgWs = null;
   const history = [];
 
-  // Interruption-related state
-  let isAiSpeaking = false;        // true while ElevenLabs audio is being sent
-  let currentAbortController = null; // cancels in-flight fetch
-  let interimUserText = '';        // builds up while user is talking
-  let isProcessing = false;        // prevents overlapping AI responses
+  let isAiSpeaking = false;
+  let currentAbortController = null;
+  let interimUserText = '';
+  let isProcessing = false;
 
-  // Connect to Deepgram with INTERIM RESULTS for interruption detection
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
     encoding: 'mulaw',
     sample_rate: '8000',
     model: 'nova-2',
     smart_format: 'true',
-    interim_results: 'true',         // we now get interim transcripts
-    utterance_end_ms: '1000',        // wait 1 sec of voice silence
-    vad_events: 'true',              // get speech-started/ended events
-    endpointing: '300',              // tighter endpointing for responsiveness
+    interim_results: 'true',
+    utterance_end_ms: '1000',
+    vad_events: 'true',
+    endpointing: '300',
   }).toString();
 
   try {
@@ -184,9 +183,7 @@ wss.on('connection', (twilioWs) => {
       try {
         const data = JSON.parse(raw.toString());
 
-        // ── VAD: Speech started ──────────────────────────────────────
         if (data.type === 'SpeechStarted') {
-          // User started talking. If AI is speaking, interrupt it.
           if (isAiSpeaking) {
             console.log('✋ INTERRUPT: user started talking, stopping AI');
             interruptAi();
@@ -194,16 +191,12 @@ wss.on('connection', (twilioWs) => {
           return;
         }
 
-        // ── Interim/Final transcript results ─────────────────────────
         if (data.type === 'Results') {
           const transcript = data.channel?.alternatives?.[0]?.transcript;
           if (!transcript || !transcript.trim()) return;
 
           if (!data.is_final) {
-            // Interim — user is still talking. Just track it.
             interimUserText = transcript;
-            // Backup interruption check: if we got interim text but missed
-            // SpeechStarted, still interrupt
             if (isAiSpeaking && transcript.length > 2) {
               console.log('✋ INTERRUPT (via interim):', transcript);
               interruptAi();
@@ -211,13 +204,10 @@ wss.on('connection', (twilioWs) => {
             return;
           }
 
-          // is_final = true → user finished a sentence
-          // Don't process yet — wait for UtteranceEnd (handles natural pauses)
           interimUserText = transcript;
           return;
         }
 
-        // ── UtteranceEnd: user truly stopped talking ─────────────────
         if (data.type === 'UtteranceEnd') {
           if (!interimUserText.trim()) return;
           if (isProcessing) return;
@@ -262,17 +252,12 @@ wss.on('connection', (twilioWs) => {
     console.error('Deepgram setup error:', err.message);
   }
 
-  // ─── Interrupt the currently playing AI response ────────────────────
   function interruptAi() {
     isAiSpeaking = false;
-
-    // Cancel the in-flight ElevenLabs request
     if (currentAbortController) {
       try { currentAbortController.abort(); } catch {}
       currentAbortController = null;
     }
-
-    // Tell Twilio to flush queued audio
     if (twilioWs.readyState === 1 && streamSid) {
       twilioWs.send(JSON.stringify({
         event: 'clear',
@@ -281,7 +266,6 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  // ─── Stream ElevenLabs audio to Twilio (interruptible) ──────────────
   async function streamAudioToTwilio(text) {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     const apiKey = process.env.ELEVENLABS_KEY;
@@ -323,14 +307,11 @@ wss.on('connection', (twilioWs) => {
 
       let totalBytes = 0;
 
-      // Iterate over response chunks, but check for interruption every chunk
       try {
         if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
           for await (const chunk of response.body) {
-            // Bail out if interrupted or socket closed
             if (!isAiSpeaking) break;
             if (twilioWs.readyState !== 1) break;
-
             const payload = Buffer.from(chunk).toString('base64');
             twilioWs.send(JSON.stringify({
               event: 'media',
@@ -378,7 +359,6 @@ wss.on('connection', (twilioWs) => {
     }
   }
 
-  // ─── Handle Twilio events ───────────────────────────────────────────
   twilioWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
@@ -400,7 +380,6 @@ wss.on('connection', (twilioWs) => {
           break;
 
         case 'media':
-          // Forward audio to Deepgram (always — even while AI speaks)
           if (dgWs && dgWs.readyState === WebSocket.OPEN && msg.media?.payload) {
             const audio = Buffer.from(msg.media.payload, 'base64');
             try {
@@ -445,9 +424,107 @@ wss.on('connection', (twilioWs) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// VAPI WEBHOOK — receives tool calls during live calls
+// Mounted at POST /vapi-webhook
+//
+// Vapi sends a request whenever the AI calls a function mid-call.
+// For now: log + auto-approve (mock). Tomorrow: real iPhone push.
+// ════════════════════════════════════════════════════════════════════
+
+app.post('/vapi-webhook', async (req, res) => {
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('🎯 VAPI WEBHOOK HIT at', new Date().toISOString());
+  console.log('Body:', JSON.stringify(req.body, null, 2).slice(0, 2000));
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  try {
+    const message = req.body?.message;
+    const messageType = message?.type;
+
+    // Only handle tool/function calls
+    if (messageType === 'tool-calls' || messageType === 'function-call') {
+      const toolCalls = message?.toolCallList || message?.toolCalls || [];
+      const functionCall = message?.functionCall;
+      const results = [];
+
+      // Modern toolCallList format
+      for (const toolCall of toolCalls) {
+        const fnName = toolCall?.function?.name || toolCall?.name;
+        const fnArgs = toolCall?.function?.arguments || toolCall?.arguments || {};
+        const toolCallId = toolCall?.id;
+
+        const args = typeof fnArgs === 'string' ? JSON.parse(fnArgs) : fnArgs;
+
+        console.log(`📞 Tool call: ${fnName}`);
+        console.log(`   Args:`, args);
+
+        if (fnName === 'request_permission') {
+          const result = {
+            approved: true,
+            value: getMockValueForCategory(args?.category),
+            note: '[MOCK auto-approve. Real permission via iPhone push tomorrow.]',
+          };
+          console.log(`   ✅ Auto-approved (mock):`, result);
+
+          results.push({
+            toolCallId,
+            result: JSON.stringify(result),
+          });
+        } else {
+          console.log(`   ⚠️ Unknown tool: ${fnName}`);
+          results.push({
+            toolCallId,
+            result: JSON.stringify({ error: `Unknown tool: ${fnName}` }),
+          });
+        }
+      }
+
+      // Legacy functionCall format
+      if (functionCall && results.length === 0) {
+        const fnName = functionCall?.name;
+        const fnArgs = functionCall?.parameters || {};
+        console.log(`📞 (legacy) Function call: ${fnName}`, fnArgs);
+        if (fnName === 'request_permission') {
+          return res.json({
+            result: JSON.stringify({
+              approved: true,
+              value: getMockValueForCategory(fnArgs?.category),
+              note: '[MOCK auto-approve.]',
+            }),
+          });
+        }
+      }
+
+      return res.json({ results });
+    }
+
+    // Other Vapi message types — just log and acknowledge
+    console.log(`ℹ️ Vapi message type "${messageType}" — no action needed`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Vapi webhook error:', err);
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// Mock data for development — returns realistic-looking but fake info
+// Tomorrow: pull from user's actual vault via authenticated request
+function getMockValueForCategory(category) {
+  const mocks = {
+    ssn: 'XXX-XX-' + Math.floor(1000 + Math.random() * 9000),
+    license: 'D' + Math.floor(1000000 + Math.random() * 9000000),
+    insurance: 'Aetna PPO #' + Math.floor(100000 + Math.random() * 900000),
+    address: '123 Main St, San Francisco, CA 94102',
+    creditcard: '**** **** **** 1234',
+    bank: 'Chase ****5678',
+  };
+  return mocks[category] || '[mock value]';
+}
+
+// ════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
-  res.send('PLA FAIR server is alive! Streaming + legacy routes ready.');
+  res.send('PLA FAIR server is alive! Streaming + legacy + Vapi webhook ready.');
 });
 
 server.listen(PORT, () => {
@@ -456,4 +533,5 @@ server.listen(PORT, () => {
   console.log(`🎙️  ElevenLabs voice: ${process.env.ELEVENLABS_VOICE_ID || 'NOT SET'}`);
   console.log(`📞 Legacy inbound: /voice (Gather-based, slower but stable)`);
   console.log(`⚡ STREAMING inbound: /stream-voice (full duplex with interruptions)`);
+  console.log(`🎯 VAPI webhook: /vapi-webhook (permission requests)`);
 });
