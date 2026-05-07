@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 app.use(express.urlencoded({ extended: false }));
-// NEW: parse JSON for Vapi webhook (Vapi sends JSON, not form-encoded)
 app.use(express.json({ limit: '5mb' }));
 
 const claude = new Anthropic.default({
@@ -130,7 +129,7 @@ app.get('/audio/:id', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
-// STREAMING WITH FULL DUPLEX INTERRUPTION
+// STREAMING WITH FULL DUPLEX INTERRUPTION (unchanged)
 // ════════════════════════════════════════════════════════════════════
 
 app.post('/stream-voice', (req, res) => {
@@ -149,228 +148,89 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 
 wss.on('connection', (twilioWs) => {
   console.log('🔌 [STREAM] Twilio connected');
-
-  let streamSid = null;
-  let dgWs = null;
-  const history = [];
-
-  let isAiSpeaking = false;
-  let currentAbortController = null;
-  let interimUserText = '';
-  let isProcessing = false;
-
+  let streamSid = null; let dgWs = null; const history = [];
+  let isAiSpeaking = false; let currentAbortController = null; let interimUserText = ''; let isProcessing = false;
   const dgUrl = 'wss://api.deepgram.com/v1/listen?' + new URLSearchParams({
-    encoding: 'mulaw',
-    sample_rate: '8000',
-    model: 'nova-2',
-    smart_format: 'true',
-    interim_results: 'true',
-    utterance_end_ms: '1000',
-    vad_events: 'true',
-    endpointing: '300',
+    encoding: 'mulaw', sample_rate: '8000', model: 'nova-2', smart_format: 'true',
+    interim_results: 'true', utterance_end_ms: '1000', vad_events: 'true', endpointing: '300',
   }).toString();
-
   try {
-    dgWs = new WebSocket(dgUrl, {
-      headers: { Authorization: `Token ${process.env.DEEPGRAM_KEY}` },
-    });
-
-    dgWs.on('open', () => {
-      console.log('✅ Deepgram connected (full duplex mode)');
-    });
-
+    dgWs = new WebSocket(dgUrl, { headers: { Authorization: `Token ${process.env.DEEPGRAM_KEY}` } });
+    dgWs.on('open', () => { console.log('✅ Deepgram connected'); });
     dgWs.on('message', async (raw) => {
       try {
         const data = JSON.parse(raw.toString());
-
-        if (data.type === 'SpeechStarted') {
-          if (isAiSpeaking) {
-            console.log('✋ INTERRUPT: user started talking, stopping AI');
-            interruptAi();
-          }
-          return;
-        }
-
+        if (data.type === 'SpeechStarted') { if (isAiSpeaking) { interruptAi(); } return; }
         if (data.type === 'Results') {
           const transcript = data.channel?.alternatives?.[0]?.transcript;
           if (!transcript || !transcript.trim()) return;
-
-          if (!data.is_final) {
-            interimUserText = transcript;
-            if (isAiSpeaking && transcript.length > 2) {
-              console.log('✋ INTERRUPT (via interim):', transcript);
-              interruptAi();
-            }
-            return;
-          }
-
-          interimUserText = transcript;
-          return;
+          if (!data.is_final) { interimUserText = transcript; if (isAiSpeaking && transcript.length > 2) interruptAi(); return; }
+          interimUserText = transcript; return;
         }
-
         if (data.type === 'UtteranceEnd') {
-          if (!interimUserText.trim()) return;
-          if (isProcessing) return;
-
-          const userSaid = interimUserText.trim();
-          interimUserText = '';
-
-          console.log('🗣️  USER:', userSaid);
-          isProcessing = true;
-          history.push({ role: 'user', content: userSaid });
-
+          if (!interimUserText.trim()) return; if (isProcessing) return;
+          const userSaid = interimUserText.trim(); interimUserText = '';
+          isProcessing = true; history.push({ role: 'user', content: userSaid });
           try {
             const message = await claude.messages.create({
-              model: 'claude-sonnet-4-5',
-              max_tokens: 120,
-              system: SYSTEM_PROMPT,
-              messages: history,
+              model: 'claude-sonnet-4-5', max_tokens: 120, system: SYSTEM_PROMPT, messages: history,
             });
             const reply = message.content[0].text;
             history.push({ role: 'assistant', content: reply });
-            console.log('🤖 PLA FAIR:', reply);
             await streamAudioToTwilio(reply);
-          } catch (err) {
-            console.error('AI error:', err.message);
-          } finally {
-            isProcessing = false;
-          }
+          } catch (err) { console.error('AI error:', err.message);
+          } finally { isProcessing = false; }
         }
-      } catch (err) {
-        console.error('Deepgram message error:', err.message);
-      }
+      } catch (err) { console.error('Deepgram message error:', err.message); }
     });
-
-    dgWs.on('error', (err) => {
-      console.error('Deepgram WS error:', err.message);
-    });
-
-    dgWs.on('close', (code, reason) => {
-      console.log('🔌 Deepgram closed:', code, reason?.toString());
-    });
-  } catch (err) {
-    console.error('Deepgram setup error:', err.message);
-  }
+    dgWs.on('error', (err) => { console.error('Deepgram WS error:', err.message); });
+    dgWs.on('close', () => { console.log('🔌 Deepgram closed'); });
+  } catch (err) { console.error('Deepgram setup error:', err.message); }
 
   function interruptAi() {
     isAiSpeaking = false;
-    if (currentAbortController) {
-      try { currentAbortController.abort(); } catch {}
-      currentAbortController = null;
-    }
+    if (currentAbortController) { try { currentAbortController.abort(); } catch {} currentAbortController = null; }
     if (twilioWs.readyState === 1 && streamSid) {
-      twilioWs.send(JSON.stringify({
-        event: 'clear',
-        streamSid,
-      }));
+      twilioWs.send(JSON.stringify({ event: 'clear', streamSid }));
     }
   }
 
   async function streamAudioToTwilio(text) {
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     const apiKey = process.env.ELEVENLABS_KEY;
-    if (!voiceId || !apiKey) {
-      console.error('Missing ElevenLabs config');
-      return;
-    }
-
-    console.log('🎙️  Speaking:', text.slice(0, 50));
-
-    isAiSpeaking = true;
-    currentAbortController = new AbortController();
-
+    if (!voiceId || !apiKey) return;
+    isAiSpeaking = true; currentAbortController = new AbortController();
     try {
       const response = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`,
         {
           method: 'POST',
-          headers: {
-            'xi-api-key': apiKey,
-            'Content-Type': 'application/json',
-            'Accept': 'audio/basic',
-          },
-          body: JSON.stringify({
-            text,
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-          }),
+          headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json', 'Accept': 'audio/basic' },
+          body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
           signal: currentAbortController.signal,
         }
       );
-
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        console.error('ElevenLabs failed:', response.status, errText.slice(0, 200));
-        isAiSpeaking = false;
-        return;
-      }
-
-      let totalBytes = 0;
-
+      if (!response.ok) { isAiSpeaking = false; return; }
       try {
         if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
           for await (const chunk of response.body) {
-            if (!isAiSpeaking) break;
-            if (twilioWs.readyState !== 1) break;
+            if (!isAiSpeaking) break; if (twilioWs.readyState !== 1) break;
             const payload = Buffer.from(chunk).toString('base64');
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload },
-            }));
-            totalBytes += chunk.length;
-          }
-        } else if (response.body && response.body.getReader) {
-          const reader = response.body.getReader();
-          while (true) {
-            if (!isAiSpeaking) break;
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (twilioWs.readyState !== 1) break;
-            const payload = Buffer.from(value).toString('base64');
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload },
-            }));
-            totalBytes += value.length;
+            twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
           }
         }
-      } catch (streamErr) {
-        if (streamErr.name === 'AbortError') {
-          console.log(`🚫 Audio aborted (${totalBytes} bytes sent before interrupt)`);
-        } else {
-          console.error('Stream read error:', streamErr.message);
-        }
-      }
-
-      if (isAiSpeaking) {
-        console.log(`✅ Audio fully sent (${totalBytes} bytes)`);
-      }
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        console.log('🚫 ElevenLabs request cancelled');
-      } else {
-        console.error('ElevenLabs error:', err.message);
-      }
-    } finally {
-      isAiSpeaking = false;
-      currentAbortController = null;
-    }
+      } catch (streamErr) { if (streamErr.name !== 'AbortError') console.error('Stream error:', streamErr.message); }
+    } catch (err) { if (err.name !== 'AbortError') console.error('ElevenLabs error:', err.message); }
+    finally { isAiSpeaking = false; currentAbortController = null; }
   }
 
   twilioWs.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-
       switch (msg.event) {
-        case 'connected':
-          console.log('📡 Twilio Stream connected');
-          break;
-
+        case 'connected': break;
         case 'start':
           streamSid = msg.start.streamSid;
-          console.log('▶️  Stream started:', streamSid);
           (async () => {
             await new Promise(r => setTimeout(r, 200));
             const greeting = "Hello, this is pla FAIR. How can I help?";
@@ -378,57 +238,31 @@ wss.on('connection', (twilioWs) => {
             await streamAudioToTwilio(greeting);
           })();
           break;
-
         case 'media':
           if (dgWs && dgWs.readyState === WebSocket.OPEN && msg.media?.payload) {
-            const audio = Buffer.from(msg.media.payload, 'base64');
-            try {
-              dgWs.send(audio);
-            } catch {}
+            try { dgWs.send(Buffer.from(msg.media.payload, 'base64')); } catch {}
           }
           break;
-
         case 'stop':
-          console.log('⏹️  Stream stopped');
           isAiSpeaking = false;
-          if (currentAbortController) {
-            try { currentAbortController.abort(); } catch {}
-          }
+          if (currentAbortController) { try { currentAbortController.abort(); } catch {} }
           if (dgWs && dgWs.readyState === WebSocket.OPEN) {
-            try {
-              dgWs.send(JSON.stringify({ type: 'CloseStream' }));
-              dgWs.close();
-            } catch {}
+            try { dgWs.send(JSON.stringify({ type: 'CloseStream' })); dgWs.close(); } catch {}
           }
           break;
       }
-    } catch (err) {
-      console.error('Twilio message error:', err.message);
-    }
+    } catch (err) { console.error('Twilio message error:', err.message); }
   });
 
   twilioWs.on('close', () => {
-    console.log('🔌 Twilio WS closed');
     isAiSpeaking = false;
-    if (currentAbortController) {
-      try { currentAbortController.abort(); } catch {}
-    }
-    if (dgWs && dgWs.readyState === WebSocket.OPEN) {
-      try { dgWs.close(); } catch {}
-    }
-  });
-
-  twilioWs.on('error', (err) => {
-    console.error('Twilio WS error:', err.message);
+    if (currentAbortController) { try { currentAbortController.abort(); } catch {} }
+    if (dgWs && dgWs.readyState === WebSocket.OPEN) { try { dgWs.close(); } catch {} }
   });
 });
 
 // ════════════════════════════════════════════════════════════════════
-// VAPI WEBHOOK — receives tool calls during live calls
-// Mounted at POST /vapi-webhook
-//
-// Vapi sends a request whenever the AI calls a function mid-call.
-// For now: log + auto-approve (mock). Tomorrow: real iPhone push.
+// VAPI WEBHOOK — for permission requests during calls
 // ════════════════════════════════════════════════════════════════════
 
 app.post('/vapi-webhook', async (req, res) => {
@@ -441,49 +275,35 @@ app.post('/vapi-webhook', async (req, res) => {
     const message = req.body?.message;
     const messageType = message?.type;
 
-    // Only handle tool/function calls
     if (messageType === 'tool-calls' || messageType === 'function-call') {
       const toolCalls = message?.toolCallList || message?.toolCalls || [];
       const functionCall = message?.functionCall;
       const results = [];
 
-      // Modern toolCallList format
       for (const toolCall of toolCalls) {
         const fnName = toolCall?.function?.name || toolCall?.name;
         const fnArgs = toolCall?.function?.arguments || toolCall?.arguments || {};
         const toolCallId = toolCall?.id;
-
         const args = typeof fnArgs === 'string' ? JSON.parse(fnArgs) : fnArgs;
 
-        console.log(`📞 Tool call: ${fnName}`);
-        console.log(`   Args:`, args);
+        console.log(`📞 Tool call: ${fnName}`, args);
 
         if (fnName === 'request_permission') {
           const result = {
             approved: true,
             value: getMockValueForCategory(args?.category),
-            note: '[MOCK auto-approve. Real permission via iPhone push tomorrow.]',
+            note: '[MOCK auto-approve. Real iPhone push tomorrow.]',
           };
           console.log(`   ✅ Auto-approved (mock):`, result);
-
-          results.push({
-            toolCallId,
-            result: JSON.stringify(result),
-          });
+          results.push({ toolCallId, result: JSON.stringify(result) });
         } else {
-          console.log(`   ⚠️ Unknown tool: ${fnName}`);
-          results.push({
-            toolCallId,
-            result: JSON.stringify({ error: `Unknown tool: ${fnName}` }),
-          });
+          results.push({ toolCallId, result: JSON.stringify({ error: `Unknown tool: ${fnName}` }) });
         }
       }
 
-      // Legacy functionCall format
       if (functionCall && results.length === 0) {
         const fnName = functionCall?.name;
         const fnArgs = functionCall?.parameters || {};
-        console.log(`📞 (legacy) Function call: ${fnName}`, fnArgs);
         if (fnName === 'request_permission') {
           return res.json({
             result: JSON.stringify({
@@ -498,8 +318,6 @@ app.post('/vapi-webhook', async (req, res) => {
       return res.json({ results });
     }
 
-    // Other Vapi message types — just log and acknowledge
-    console.log(`ℹ️ Vapi message type "${messageType}" — no action needed`);
     return res.json({ ok: true });
   } catch (err) {
     console.error('Vapi webhook error:', err);
@@ -507,8 +325,6 @@ app.post('/vapi-webhook', async (req, res) => {
   }
 });
 
-// Mock data for development — returns realistic-looking but fake info
-// Tomorrow: pull from user's actual vault via authenticated request
 function getMockValueForCategory(category) {
   const mocks = {
     ssn: 'XXX-XX-' + Math.floor(1000 + Math.random() * 9000),
@@ -522,16 +338,113 @@ function getMockValueForCategory(category) {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// IN-APP CHAT — NEW
+// pla FAIR's in-app AI helper for users
+// ════════════════════════════════════════════════════════════════════
+
+const APP_HELPER_SYSTEM_PROMPT = `You are pla FAIR's in-app AI helper. You assist users INSIDE the pla FAIR mobile app.
+
+ABOUT THE APP:
+pla FAIR is an AI phone assistant. Users tell it who to call and why, and it makes the call for them — handling the entire conversation in their voice (if voice cloning is set up).
+
+KEY APP FEATURES YOU SHOULD KNOW:
+- HOME TAB: starts new calls. Pick a template (DMV, Doctor, Restaurant, etc.) → answer questions → AI calls for them.
+- PLACES TAB: save spots they call regularly (Joe's Pizza, library). Has a "Find places near me" feature using Google Places.
+- VAULT TAB: encrypted on-device storage for sensitive info (license, SSN, insurance, etc.). Has 3 protection levels:
+  • L1 (Standard): auto-released on calls
+  • L2 (Confirm): user must tap to allow each share
+  • L3 (Maximum): Face ID required (coming soon)
+- HISTORY TAB: every call with transcript and audio recording.
+- SETTINGS TAB: voice clone (record 60s of voice for AI to use), theme, transcripts toggle.
+
+YOUR JOB:
+1. Help users understand and use the app's features
+2. Help users compose what to say on a call (if they ask "what should I say to the DMV about...")
+3. Suggest the right template for their situation
+4. Be friendly, concise, and helpful
+
+RULES:
+- Keep responses SHORT — 2-4 sentences max unless user asks for detail
+- Use plain text, no markdown, no asterisks
+- If they ask something unrelated to the app, gently redirect: "I'm here to help with pla FAIR — what call do you need to make?"
+- Never give legal, medical, or financial advice. Suggest they call a professional via pla FAIR.
+- If user is frustrated, acknowledge it and offer specific help.
+
+EXAMPLES:
+User: "How do I clone my voice?"
+You: "Go to Settings → Voice Clone, then tap the mic and read the script for about 60 seconds. Takes 2 minutes total. After it's ready, all your calls will use your voice instead of a generic one."
+
+User: "I need to call the DMV about my license"
+You: "Use the DMV templates on Home — there's options for renewing, replacing a lost license, REAL ID, and more. Pick the one that fits, fill in your state and DMV phone, and pla FAIR makes the call."`;
+
+app.post('/chat', async (req, res) => {
+  console.log('💬 CHAT request');
+  try {
+    const { messages, contextHints } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array required' });
+    }
+
+    // Build system prompt with optional dynamic context
+    let systemPrompt = APP_HELPER_SYSTEM_PROMPT;
+    if (contextHints && typeof contextHints === 'object') {
+      const hints = [];
+      if (contextHints.userName) hints.push(`The user's name is ${contextHints.userName}.`);
+      if (contextHints.hasVoiceClone) hints.push(`The user has voice cloning set up.`);
+      else hints.push(`The user has NOT yet set up voice cloning.`);
+      if (typeof contextHints.vaultItemCount === 'number') {
+        hints.push(`The user has ${contextHints.vaultItemCount} vault items saved.`);
+      }
+      if (typeof contextHints.placeCount === 'number') {
+        hints.push(`The user has ${contextHints.placeCount} saved places.`);
+      }
+      if (typeof contextHints.callCount === 'number') {
+        hints.push(`The user has made ${contextHints.callCount} total calls.`);
+      }
+      if (hints.length > 0) {
+        systemPrompt += `\n\nCURRENT USER CONTEXT:\n${hints.join('\n')}`;
+      }
+    }
+
+    // Sanitize messages — only role and content
+    const cleanMessages = messages
+      .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
+      .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }))
+      .slice(-20); // last 20 messages max
+
+    if (cleanMessages.length === 0 || cleanMessages[cleanMessages.length - 1].role !== 'user') {
+      return res.status(400).json({ error: 'last message must be from user' });
+    }
+
+    const completion = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 400,
+      system: systemPrompt,
+      messages: cleanMessages,
+    });
+
+    const reply = completion.content?.[0]?.text || "Sorry, I couldn't generate a response.";
+    console.log(`💬 → ${reply.slice(0, 80)}...`);
+
+    return res.json({ reply });
+  } catch (err) {
+    console.error('Chat error:', err);
+    return res.status(500).json({ error: err?.message || 'chat failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
-  res.send('PLA FAIR server is alive! Streaming + legacy + Vapi webhook ready.');
+  res.send('PLA FAIR server is alive! Streaming + legacy + Vapi webhook + chat ready.');
 });
 
 server.listen(PORT, () => {
   console.log(`✅ Server listening on port ${PORT}`);
   console.log(`🧠 Claude: READY`);
   console.log(`🎙️  ElevenLabs voice: ${process.env.ELEVENLABS_VOICE_ID || 'NOT SET'}`);
-  console.log(`📞 Legacy inbound: /voice (Gather-based, slower but stable)`);
-  console.log(`⚡ STREAMING inbound: /stream-voice (full duplex with interruptions)`);
-  console.log(`🎯 VAPI webhook: /vapi-webhook (permission requests)`);
+  console.log(`📞 Legacy inbound: /voice`);
+  console.log(`⚡ STREAMING inbound: /stream-voice`);
+  console.log(`🎯 VAPI webhook: /vapi-webhook`);
+  console.log(`💬 In-app chat: /chat`);
 });
