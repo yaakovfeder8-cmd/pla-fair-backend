@@ -327,7 +327,7 @@ app.post('/vapi-webhook', async (req, res) => {
 
 function getMockValueForCategory(category) {
   const mocks = {
-    ssn: 'XXX-XX-' + Math.floor(1000 + Math.random() * 9000),
+    ssn: String(Math.floor(1000 + Math.random() * 9000)),
     license: 'D' + Math.floor(1000000 + Math.random() * 9000000),
     insurance: 'Aetna PPO #' + Math.floor(100000 + Math.random() * 900000),
     address: '123 Main St, San Francisco, CA 94102',
