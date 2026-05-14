@@ -29,6 +29,9 @@ const conversations = {};
 const audioCache = {};
 const AUDIO_TTL_MS = 5 * 60 * 1000;
 
+const pushTokens = new Map();      // callId -> expoPushToken
+const pendingRequests = new Map(); // requestId -> { resolve, timer }
+
 const escapeXml = (s) => s
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
@@ -126,6 +129,16 @@ app.get('/audio/:id', (req, res) => {
   res.set('Content-Type', 'audio/mpeg');
   res.set('Content-Length', buf.length);
   res.send(buf);
+});
+
+app.post('/register-push-token', (req, res) => {
+  const { callId, pushToken } = req.body || {};
+  if (!callId || typeof callId !== 'string' || !pushToken || typeof pushToken !== 'string') {
+    return res.status(400).json({ error: 'callId and pushToken (strings) required' });
+  }
+  pushTokens.set(callId, pushToken);
+  console.log(`📲 Push token registered — callId: ${callId}, token: ${pushToken.slice(0, 20)}...`);
+  return res.json({ ok: true });
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -274,6 +287,7 @@ app.post('/vapi-webhook', async (req, res) => {
   try {
     const message = req.body?.message;
     const messageType = message?.type;
+    const callId = req.body?.call?.id;
 
     if (messageType === 'tool-calls' || messageType === 'function-call') {
       const toolCalls = message?.toolCallList || message?.toolCalls || [];
@@ -289,13 +303,56 @@ app.post('/vapi-webhook', async (req, res) => {
         console.log(`📞 Tool call: ${fnName}`, args);
 
         if (fnName === 'request_permission') {
-          const result = {
-            approved: true,
-            value: getMockValueForCategory(args?.category),
-            note: '[MOCK auto-approve. Real iPhone push tomorrow.]',
-          };
-          console.log(`   ✅ Auto-approved (mock):`, result);
-          results.push({ toolCallId, result: JSON.stringify(result) });
+          const { category, reason } = args;
+          console.log(`🔐 [VAPI] request_permission — callId: ${callId}, category: ${category}, reason: ${reason}`);
+
+          const pushToken = pushTokens.get(callId);
+          if (!pushToken) {
+            console.log(`⚠️  No push token for callId: ${callId}`);
+            results.push({ toolCallId, result: JSON.stringify({ approved: false, error: 'no push token' }) });
+            continue;
+          }
+
+          const requestId = randomUUID();
+          console.log(`📤 Sending Expo push — requestId: ${requestId}, token: ${pushToken.slice(0, 20)}...`);
+
+          try {
+            const pushRes = await fetch('https://exp.host/--/api/v2/push/send', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Accept-encoding': 'gzip, deflate',
+              },
+              body: JSON.stringify({
+                to: pushToken,
+                title: 'Permission request',
+                body: `Asking for your ${category} — ${reason}`,
+                data: { requestId, category, reason, callId },
+                sound: 'default',
+                priority: 'high',
+              }),
+            });
+            const pushBody = await pushRes.json();
+            console.log(`📬 Expo push response:`, JSON.stringify(pushBody));
+          } catch (pushErr) {
+            console.error(`❌ Expo push failed:`, pushErr.message);
+            results.push({ toolCallId, result: JSON.stringify({ approved: false, error: 'push send failed' }) });
+            continue;
+          }
+
+          const decision = await new Promise((resolve) => {
+            const timer = setTimeout(() => {
+              pendingRequests.delete(requestId);
+              console.log(`⏱️  Timed out — requestId: ${requestId}`);
+              resolve({ approved: false, timedOut: true });
+            }, 25000);
+            pendingRequests.set(requestId, { resolve, timer });
+            console.log(`⏳ Awaiting user decision — requestId: ${requestId}`);
+          });
+
+          console.log(`🎯 Decision received — requestId: ${requestId}, approved: ${decision.approved}`);
+          results.push({ toolCallId, result: JSON.stringify({ approved: decision.approved, value: decision.value }) });
         } else {
           results.push({ toolCallId, result: JSON.stringify({ error: `Unknown tool: ${fnName}` }) });
         }
@@ -434,6 +491,30 @@ app.post('/chat', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+
+app.post('/vapi-permission-approve', (req, res) => {
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('🔓 /vapi-permission-approve hit at', new Date().toISOString());
+  console.log('Body:', JSON.stringify(req.body));
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  const { requestId, approved, value } = req.body || {};
+  if (!requestId || typeof requestId !== 'string') {
+    return res.status(400).json({ error: 'requestId required' });
+  }
+
+  const pending = pendingRequests.get(requestId);
+  if (!pending) {
+    console.log(`⚠️  requestId not found or expired: ${requestId}`);
+    return res.status(404).json({ error: 'request not found or expired' });
+  }
+
+  clearTimeout(pending.timer);
+  pendingRequests.delete(requestId);
+  console.log(`✅ Resolving — requestId: ${requestId}, approved: ${approved}, value: ${value}`);
+  pending.resolve({ approved: !!approved, value });
+  return res.json({ ok: true });
+});
 
 app.get('/', (req, res) => {
   res.send('PLA FAIR server is alive! Streaming + legacy + Vapi webhook + chat ready.');
