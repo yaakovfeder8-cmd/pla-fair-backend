@@ -282,12 +282,23 @@ app.post('/vapi-webhook', async (req, res) => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('🎯 VAPI WEBHOOK HIT at', new Date().toISOString());
   console.log('Body:', JSON.stringify(req.body, null, 2).slice(0, 2000));
+  console.log('🔍 Body top-level keys:', Object.keys(req.body || {}));
+  console.log('🔍 message keys:', Object.keys(req.body?.message || {}));
+  console.log('🔍 req.body.call:', JSON.stringify(req.body?.call));
+  console.log('🔍 req.body.message.call:', JSON.stringify(req.body?.message?.call));
+  console.log('🔍 req.body.message.artifact:', JSON.stringify(req.body?.message?.artifact));
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 
   try {
     const message = req.body?.message;
     const messageType = message?.type;
-    const callId = req.body?.call?.id;
+    const callId =
+      req.body?.message?.call?.id ||
+      req.body?.call?.id ||
+      req.body?.message?.artifact?.callId ||
+      req.body?.message?.toolCallList?.[0]?.callId ||
+      null;
+    console.log('📍 Resolved callId:', callId);
 
     if (messageType === 'tool-calls' || messageType === 'function-call') {
       const toolCalls = message?.toolCallList || message?.toolCalls || [];
