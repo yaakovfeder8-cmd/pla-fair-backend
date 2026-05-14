@@ -337,11 +337,17 @@ app.post('/vapi-webhook', async (req, res) => {
               },
               body: JSON.stringify({
                 to: pushToken,
-                title: 'Permission request',
-                body: `Asking for your ${category} — ${reason}`,
+                title: '🔐 Permission needed: ' + category,
+                body: 'AI on call wants to share your ' + category + ' — ' + reason,
                 data: { requestId, category, reason, callId },
                 sound: 'default',
                 priority: 'high',
+                categoryId: 'permission_request',
+                _displayInForeground: true,
+                _contentAvailable: true,
+                ttl: 30,
+                channelId: 'permissions',
+                interruptionLevel: 'time-sensitive',
               }),
             });
             const pushBody = await pushRes.json();
