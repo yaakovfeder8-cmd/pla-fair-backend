@@ -31,6 +31,7 @@ const AUDIO_TTL_MS = 5 * 60 * 1000;
 
 const pushTokens = new Map();      // callId -> expoPushToken
 const pendingRequests = new Map(); // requestId -> { resolve, timer }
+const liveTranscripts = new Map(); // callId -> messages array
 
 const escapeXml = (s) => s
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -300,6 +301,13 @@ app.post('/vapi-webhook', async (req, res) => {
       null;
     console.log('📍 Resolved callId:', callId);
 
+    if (messageType === 'conversation-update') {
+      const messages = req.body.message.messages || [];
+      liveTranscripts.set(callId, messages);
+      console.log('📝 Transcript update —', callId, '—', messages.length, 'msgs');
+      return res.json({ ok: true });
+    }
+
     if (messageType === 'tool-calls' || messageType === 'function-call') {
       const toolCalls = message?.toolCallList || message?.toolCalls || [];
       const functionCall = message?.functionCall;
@@ -390,6 +398,12 @@ app.post('/vapi-webhook', async (req, res) => {
       }
 
       return res.json({ results });
+    }
+
+    if (messageType === 'end-of-call-report' ||
+        (messageType === 'status-update' && message?.status === 'ended')) {
+      if (callId) setTimeout(() => { liveTranscripts.delete(callId); }, 5 * 60 * 1000);
+      console.log('🏁 Call ended — transcript cleared in 5 min:', callId);
     }
 
     return res.json({ ok: true });
@@ -531,6 +545,10 @@ app.post('/vapi-permission-approve', (req, res) => {
   console.log(`✅ Resolving — requestId: ${requestId}, approved: ${approved}, value: ${value}`);
   pending.resolve({ approved: !!approved, value });
   return res.json({ ok: true });
+});
+
+app.get('/call-transcript/:callId', (req, res) => {
+  res.json({ messages: liveTranscripts.get(req.params.callId) || [] });
 });
 
 app.get('/', (req, res) => {
