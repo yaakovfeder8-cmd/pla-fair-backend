@@ -523,6 +523,32 @@ app.post('/chat', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════════
 
+app.post('/ai-generate', async (req, res) => {
+  try {
+    const { system, messages, model, max_tokens } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'messages array required' });
+    }
+    const response = await claude.messages.create({
+      model: model || 'claude-haiku-4-5-20251001',
+      max_tokens: max_tokens || 1024,
+      ...(system ? { system } : {}),
+      messages,
+    });
+    const text = (response.content || [])
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text)
+      .join('');
+    console.log('🧠 /ai-generate ok —', text.length, 'chars');
+    res.json({ text });
+  } catch (e) {
+    console.error('❌ /ai-generate error:', e.message);
+    res.status(500).json({ error: 'generation failed' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════
+
 app.post('/vapi-permission-approve', (req, res) => {
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('🔓 /vapi-permission-approve hit at', new Date().toISOString());
