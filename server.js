@@ -647,6 +647,66 @@ app.post('/voice-clone', upload.single('audio'), async (req, res) => {
   }
 });
 
+app.post('/voice-delete', async (req, res) => {
+  try {
+    const { voice_id, install_id } = req.body || {};
+    if (!voice_id || typeof voice_id !== 'string') {
+      return res.status(400).json({ error: 'voice_id required' });
+    }
+    if (!install_id || typeof install_id !== 'string') {
+      return res.status(400).json({ error: 'install_id required' });
+    }
+
+    const apiKey = process.env.ELEVENLABS_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ElevenLabs not configured' });
+
+    const elRes = await fetch(`https://api.elevenlabs.io/v1/voices/${voice_id}`, {
+      method: 'DELETE',
+      headers: { 'xi-api-key': apiKey },
+    });
+
+    const elBody = await elRes.json().catch(() => ({}));
+    if (!elRes.ok) {
+      console.error('ElevenLabs voice-delete error:', elBody);
+      return res.status(502).json({ error: 'ElevenLabs error', detail: elBody });
+    }
+
+    console.log(`🗑️  Voice deleted — install_id: ${install_id}, voice_id: ${voice_id}`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Voice delete error:', err);
+    return res.status(500).json({ error: err?.message || 'voice delete failed' });
+  }
+});
+
+app.post('/voice-info', async (req, res) => {
+  try {
+    const { voice_id } = req.body || {};
+    if (!voice_id || typeof voice_id !== 'string') {
+      return res.status(400).json({ error: 'voice_id required' });
+    }
+
+    const apiKey = process.env.ELEVENLABS_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ElevenLabs not configured' });
+
+    const elRes = await fetch(`https://api.elevenlabs.io/v1/voices/${voice_id}`, {
+      headers: { 'xi-api-key': apiKey },
+    });
+
+    const elBody = await elRes.json();
+    if (!elRes.ok) {
+      console.error('ElevenLabs voice-info error:', elBody);
+      return res.status(502).json({ error: 'ElevenLabs error', detail: elBody });
+    }
+
+    console.log(`ℹ️  Voice info — voice_id: ${voice_id}`);
+    return res.json(elBody);
+  } catch (err) {
+    console.error('Voice info error:', err);
+    return res.status(500).json({ error: err?.message || 'voice info failed' });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('PLA FAIR server is alive! Streaming + legacy + Vapi webhook + chat ready.');
 });
