@@ -11,6 +11,7 @@
     "@deepgram/sdk": "^5.1.0",
     "dotenv": "latest",
     "express": "latest",
+    "multer": "^2.1.1",
     "twilio": "latest",
     "ws": "^8.20.0"
   }

@@ -12,6 +12,9 @@ const server = http.createServer(app);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json({ limit: '5mb' }));
 
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
 const claude = new Anthropic.default({
   apiKey: process.env.ANTHROPIC_KEY,
 });
@@ -32,6 +35,19 @@ const AUDIO_TTL_MS = 5 * 60 * 1000;
 const pushTokens = new Map();      // callId -> expoPushToken
 const pendingRequests = new Map(); // requestId -> { resolve, timer }
 const liveTranscripts = new Map(); // callId -> messages array
+
+// Rate limiting
+const voiceCloneLog = new Map(); // install_id -> number[]  (timestamps)
+const chatLog = new Map();       // install_id -> number[]  (timestamps)
+
+function withinLimit(map, id, max, windowMs) {
+  const now = Date.now();
+  const hits = (map.get(id) || []).filter(t => now - t < windowMs);
+  if (hits.length >= max) return false;
+  hits.push(now);
+  map.set(id, hits);
+  return true;
+}
 
 const escapeXml = (s) => s
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -468,7 +484,14 @@ You: "Use the DMV templates on Home — there's options for renewing, replacing 
 app.post('/chat', async (req, res) => {
   console.log('💬 CHAT request');
   try {
-    const { messages, contextHints } = req.body || {};
+    const { messages, contextHints, install_id } = req.body || {};
+
+    if (install_id && !withinLimit(chatLog, install_id, 30, 60 * 60 * 1000)) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded: 30 messages per hour per device. Try again later.',
+      });
+    }
+
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages array required' });
     }
@@ -575,6 +598,53 @@ app.post('/vapi-permission-approve', (req, res) => {
 
 app.get('/call-transcript/:callId', (req, res) => {
   res.json({ messages: liveTranscripts.get(req.params.callId) || [] });
+});
+
+app.post('/voice-clone', upload.single('audio'), async (req, res) => {
+  try {
+    const { install_id, name } = req.body || {};
+    if (!install_id || typeof install_id !== 'string') {
+      return res.status(400).json({ error: 'install_id required' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'audio file required (field: audio)' });
+    }
+
+    if (!withinLimit(voiceCloneLog, install_id, 2, 7 * 24 * 60 * 60 * 1000)) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded: 2 voice clones per 7-day window per device.',
+      });
+    }
+
+    const apiKey = process.env.ELEVENLABS_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'ElevenLabs not configured' });
+
+    const form = new FormData();
+    form.append('name', (name || `clone_${install_id}`).slice(0, 100));
+    form.append(
+      'files',
+      new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/mpeg' }),
+      req.file.originalname || 'voice.m4a',
+    );
+
+    const elRes = await fetch('https://api.elevenlabs.io/v1/voices/add', {
+      method: 'POST',
+      headers: { 'xi-api-key': apiKey },
+      body: form,
+    });
+
+    const elBody = await elRes.json();
+    if (!elRes.ok) {
+      console.error('ElevenLabs voice-add error:', elBody);
+      return res.status(502).json({ error: 'ElevenLabs error', detail: elBody });
+    }
+
+    console.log(`🎤 Voice cloned — install_id: ${install_id}, voice_id: ${elBody.voice_id}`);
+    return res.json({ voice_id: elBody.voice_id });
+  } catch (err) {
+    console.error('Voice clone error:', err);
+    return res.status(500).json({ error: err?.message || 'voice clone failed' });
+  }
 });
 
 app.get('/', (req, res) => {
