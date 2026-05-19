@@ -40,6 +40,19 @@ const liveTranscripts = new Map(); // callId -> messages array
 const voiceCloneLog = new Map(); // install_id -> number[]  (timestamps)
 const chatLog = new Map();       // install_id -> number[]  (timestamps)
 
+function checkLimit(map, id, max, windowMs) {
+  const now = Date.now();
+  const hits = (map.get(id) || []).filter(t => now - t < windowMs);
+  return hits.length < max;
+}
+
+function recordHit(map, id, windowMs) {
+  const now = Date.now();
+  const hits = (map.get(id) || []).filter(t => now - t < windowMs);
+  hits.push(now);
+  map.set(id, hits);
+}
+
 function withinLimit(map, id, max, windowMs) {
   const now = Date.now();
   const hits = (map.get(id) || []).filter(t => now - t < windowMs);
@@ -610,7 +623,7 @@ app.post('/voice-clone', upload.single('audio'), async (req, res) => {
       return res.status(400).json({ error: 'audio file required (field: audio)' });
     }
 
-    if (!withinLimit(voiceCloneLog, install_id, 2, 7 * 24 * 60 * 60 * 1000)) {
+    if (!checkLimit(voiceCloneLog, install_id, 2, 7 * 24 * 60 * 60 * 1000)) {
       return res.status(429).json({
         error: 'Rate limit exceeded: 2 voice clones per 7-day window per device.',
       });
@@ -639,6 +652,7 @@ app.post('/voice-clone', upload.single('audio'), async (req, res) => {
       return res.status(502).json({ error: 'ElevenLabs error', detail: elBody });
     }
 
+    recordHit(voiceCloneLog, install_id, 7 * 24 * 60 * 60 * 1000);
     console.log(`🎤 Voice cloned — install_id: ${install_id}, voice_id: ${elBody.voice_id}`);
     return res.json({ voice_id: elBody.voice_id });
   } catch (err) {
